@@ -1,0 +1,34 @@
+{
+  "name": "pterobot",
+  "version": "1.19.0",
+  "description": "v1.19.0: THE LIVE STATUS BOARD — /status is now a hosting-page-style NETWORK STATUS board: overall network RAM/Disk bars, a per-node breakdown with usage bars and used/free/total lines, nodes-available and servers-running counts — and the board EDITS ITSELF every 5 minutes (STATUS_REFRESH_MINUTES, 5-60), surviving bot restarts (DB-driven sweeper, exactly like giveaways). 🔄 Refresh-now and ⏹ Stop buttons on the board; posting /status again in the same channel supersedes the old board; boards retire after 24 h or an hour of dead panel instead of hammering forever. Plus v1.18.0: the climb engine (line-of-sight placement faces, bot climbs the build, jump assist, temporary cobblestone scaffolding) so /bot build produces complete houses, creative-mode builds straight from the creative inventory, self-defense that fights back zombies and players (/bot combat on|off), verified gathering, paced crafting, /giveaway, /plugins broken-jar removal, restart-safe creation sessions, /bot join on every panel and Minecraft version, the AI channel, AI server file sight, /install that never dead-ends, Pterodactyl panel Discord bot with NaraRouter AI chat that auto-diagnoses and auto-fixes your servers, /update self-editing, tickets with categories, files, backups, databases, full panel management, moderation suite, XP levels, an interactive /help center, and a Modrinth/CurseForge installer — 100% inside Discord.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "deploy": "node index.js --deploy"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@discordjs/voice": "^0.18.0",
+    "axios": "^1.7.9",
+    "better-sqlite3": "^12.11.1",
+    "discord.js": "^14.17.3",
+    "dotenv": "^16.4.7",
+    "libsodium-wrappers": "^0.7.15",
+    "mineflayer": "^4.39.0",
+    "mineflayer-collectblock": "^1.6.0",
+    "mineflayer-pathfinder": "^2.4.5"
+  },
+  "keywords": [
+    "discord",
+    "discord-bot",
+    "pterodactyl",
+    "minecraft",
+    "game-servers",
+    "ai"
+  ],
+  "license": "MIT",
+  "private": true
+}
