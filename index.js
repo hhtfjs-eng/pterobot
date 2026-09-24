@@ -498,6 +498,16 @@
  *                                  boards retire after 24 h or an hour of
  *                                  dead panel instead of hammering forever
  *                                  (1.19.0)
+ *  v1.19.1 PROBE INSIGHT: a node that shows Unreachable now says WHY
+ *                                  — the wings probe failure is classified
+ *                                  (port closed / DNS / TLS / HTTP status)
+ *                                  and printed on the board and /nodes. A
+ *                                  node whose servers are RUNNING is never
+ *                                  called dead: it shows green "Online
+ *                                  (probe blocked)" because only a live
+ *                                  daemon can run servers. STATUS_PROBE=false
+ *                                  switches probing off; STATUS_PROBE_TIMEOUT
+ *                                  tunes the 2.5 s budget (1.19.1)
  *
  *  Storage : SQLite (better-sqlite3). API keys are NEVER stored or logged.
  *  Deploy  : npm install  ->  npm start   (slash commands auto-register)
@@ -1491,7 +1501,7 @@ function addAuditRow({ userId, userTag, action, target, details }) {
 // ---------------------------------------------------------------------------
 // 4. UTILS — embeds, formatting, cooldowns, pagination, validation
 // ---------------------------------------------------------------------------
-const VERSION = '1.19.0';
+const VERSION = '1.19.1';
 const COLORS = { ok: 0x57F287, err: 0xED4245, info: 0x5865F2, warn: 0xFEE75C };
 
 function baseEmbed(color, title, description) {
@@ -4766,27 +4776,70 @@ async function getAllNodesCached(force = false) {
 // info. Nodes behind a reverse proxy also get the public /_daemon/api/system path
 // tried. First success wins; none -> unreachable (firewall/offline).
 // NOTE: the FQDN is used ONLY for probing — it is never displayed anywhere.
+//
+// v1.19.1 — PROBE INSIGHT: a failed probe now carries a human-readable `reason`
+// (classified network error / TLS problem / HTTP status) so /status, /nodes and
+// the node detail can show WHY a node is red instead of a bare "unreachable".
+// The reason NEVER contains the FQDN — only the port number / proxy path label.
+function wingsProbeReason(err, res) {
+  if (res) {
+    if (res.status >= 200 && res.status < 300) return null; // success — no reason
+    if (res.status === 404) return 'HTTP 404 — the daemon path did not answer (wrong port or scheme?)';
+    if (res.status === 502 || res.status === 503 || res.status === 504) return `HTTP ${res.status} — the reverse proxy answered but wings behind it did not`;
+    return `HTTP ${res.status} answered — the daemon is not serving on this target`;
+  }
+  const code = String((err && err.code) || '').toUpperCase();
+  const msg = String((err && err.message) || err || '');
+  if (code === 'ECONNREFUSED') return 'connection refused — the daemon port is closed or wings is down';
+  if (code === 'ETIMEDOUT' || code === 'ECONNABORTED') return 'no answer in time — firewall drop, wrong IP or daemon hung';
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return 'the node FQDN does not resolve from where the bot runs';
+  if (code === 'ECONNRESET') return 'connection reset mid-handshake — TLS scheme mismatch (https vs http)';
+  if (code === 'EHOSTUNREACH' || code === 'ENETUNREACH') return 'the node address is unreachable from where the bot runs';
+  if (/certificate|ssl|tls|self[- ]signed|SELF_SIGNED|UNABLE_TO_VERIFY|CERT_/i.test(code + ' ' + msg)) return 'TLS certificate rejected — self-signed or scheme mismatch';
+  return truncate(code || msg || 'unknown network error', 80);
+}
+
+// v1.19.1 — env knobs for the daemon probe (parsed once, unit-testable):
+//   STATUS_PROBE=false        -> no probing at all (nodes show Available unless
+//                                in maintenance; /nodes says "probe disabled")
+//   STATUS_PROBE_TIMEOUT=5000 -> per-URL timeout in ms (clamped 500-15000,
+//                                default 2500)
+function parseStatusProbeEnv(env) {
+  const rawOn = env.STATUS_PROBE;
+  const on = rawOn == null || rawOn === '' ? true : /^(1|true|yes|on)$/i.test(String(rawOn).trim());
+  const rawT = Number(env.STATUS_PROBE_TIMEOUT);
+  const timeoutMs = Number.isFinite(rawT) && rawT >= 500 ? Math.min(15000, Math.floor(rawT)) : 2500;
+  return { on, timeoutMs };
+}
+
 function wingsCheck(node) {
+  const probe = parseStatusProbeEnv(process.env);
+  if (!probe.on) return Promise.resolve({ online: null, reason: 'probe disabled (STATUS_PROBE=false)' });
   const base = `${node.scheme || 'https'}://${node.fqdn}`;
   const urls = [];
-  if (node.daemon_listen) urls.push(`${base}:${node.daemon_listen}/api/system`);
-  if (node.behind_proxy) urls.push(`${base}/_daemon/api/system`);
+  if (node.daemon_listen) urls.push({ url: `${base}:${node.daemon_listen}/api/system`, label: `port ${node.daemon_listen}` });
+  if (node.behind_proxy) urls.push({ url: `${base}/_daemon/api/system`, label: '/_daemon/ path' });
   if (!urls.length) return Promise.resolve({ online: null });
   return new Promise((resolve) => {
     let pending = urls.length;
     let settled = false;
+    const reasons = {};
     const finish = (v) => { if (!settled) { settled = true; resolve(v); } };
-    const fail = () => { pending -= 1; if (pending === 0) finish({ online: false }); };
-    for (const url of urls) {
-      axios.get(url, { timeout: 2500, validateStatus: () => true })
+    const fail = (label, err, res) => {
+      reasons[label] = wingsProbeReason(err, res);
+      pending -= 1;
+      if (pending === 0) finish({ online: false, reason: urls.map((u) => `${u.label}: ${reasons[u.label]}`).join(' • ') });
+    };
+    for (const { url, label } of urls) {
+      axios.get(url, { timeout: probe.timeoutMs, validateStatus: () => true })
         .then((res) => {
           if (res.status >= 200 && res.status < 300 && res.data) {
             finish({ online: true, version: res.data.version || null, system: res.data.system || null });
           } else {
-            fail();
+            fail(label, null, res);
           }
         })
-        .catch(fail);
+        .catch((err) => fail(label, err, null));
     }
   });
 }
@@ -4821,19 +4874,23 @@ async function nodesOverview(interaction) {
   }
   if (!nodes.length) return interaction.editReply({ embeds: [embInfo('🖥 Node status', 'The panel has no nodes configured.')] });
   const checks = await Promise.all(nodes.map(n => wingsCheck(n)));
+  const probeOff = checks.length > 0 && checks.every(c => c && c.online === null && String(c.reason || '').startsWith('probe disabled'));
   const lines = nodes.slice(0, 20).map((n, i) => {
     const c = checks[i];
     const dot = c.online === true ? '🟢' : (c.online === false ? '🔴' : '⚪');
     const state = c.online === true
       ? `online${c.version ? ` — wings v${truncate(String(c.version), 24)}` : ''}`
-      : (c.online === false ? 'unreachable' : 'unknown');
+      : (c.online === false ? 'unreachable' : (probeOff ? 'probe disabled' : 'unknown'));
     const maint = n.maintenance_mode ? ' • 🛠️ **maintenance**' : '';
-    return `${dot} **${truncate(n.name, 60)}** — ${state}${maint}\n${nodeCapacityLine(n)}`;
+    // v1.19.1 — the classified probe reason under every red node.
+    const reasonLine = c.online === false && c.reason
+      ? `\n└ probe: ${truncate(String(c.reason), 100)}` : '';
+    return `${dot} **${truncate(n.name, 60)}** — ${state}${maint}\n${nodeCapacityLine(n)}${reasonLine}`;
   });
   if (nodes.length > 20) lines.push(`…and ${nodes.length - 20} more — use \`/nodes node:<id>\` (staff) for details.`);
   const embed = embInfo('🖥 Node status')
     .setDescription(lines.join('\n'))
-    .setFooter({ text: 'Reachability is probed directly on the wings daemon • "allocated" = reserved by servers' });
+    .setFooter({ text: probeOff ? 'Daemon probe disabled (STATUS_PROBE=false) • states reflect maintenance only' : 'Reachability is probed directly on the wings daemon • "allocated" = reserved by servers' });
   _nodesOverviewCache.embed = embed;
   _nodesOverviewCache.exp = Date.now() + 30000;
   return interaction.editReply({ embeds: [embed] });
@@ -4851,12 +4908,16 @@ async function nodesDetail(interaction, id) {
   const serverCount = n.relationships && n.relationships.servers && Array.isArray(n.relationships.servers.data)
     ? n.relationships.servers.data.length : null;
   const { memAlloc, diskAlloc } = nodeAllocated(n);
+  // v1.19.1 — the classified probe reason gets its own field on the detail view.
+  const probeFields = [];
+  if (c.reason) probeFields.push({ name: 'Probe', value: truncate(String(c.reason), 500), inline: false });
   const embed = embInfo(`🖥 Node — ${n.name}`)
     .addFields(
       { name: 'ID', value: String(n.id), inline: true },
       { name: 'Location', value: String(n.location_id || '—'), inline: true },
       { name: 'Servers', value: serverCount === null ? '—' : String(serverCount), inline: true },
       { name: 'Status', value: `${c.online === true ? `🟢 online${c.version ? ` (wings v${truncate(String(c.version), 24)})` : ''}` : c.online === false ? '🔴 unreachable' : '⚪ unknown'}${n.maintenance_mode ? ' • 🛠️ maintenance' : ''}`, inline: false },
+      ...probeFields,
       { name: 'Memory', value: `${fmtBytes((n.memory || 0) * 1024 * 1024)} total • ${fmtBytes(memAlloc)} allocated • ${n.memory_overallocate ?? 0}% overallocate`, inline: true },
       { name: 'Disk', value: `${fmtBytes((n.disk || 0) * 1024 * 1024)} total • ${fmtBytes(diskAlloc)} allocated • ${n.disk_overallocate ?? 0}% overallocate`, inline: true },
       { name: 'Upload size', value: fmtBytes((n.upload_size || 0) * 1024 * 1024), inline: true },
@@ -9315,6 +9376,25 @@ async function networkStatusData(opts = {}) {
     const nid = s && s.node_id != null ? Number(s.node_id) : null;
     if (nid !== null) perNode.set(nid, (perNode.get(nid) || 0) + 1);
   }
+  // v1.19.1 — PROBE INSIGHT fallback signal: a server can only be RUNNING if
+  // its node's wings daemon is alive AND connected to the panel (wings reports
+  // state through the panel's websocket). Map the client-key servers (which
+  // carry live current_state) onto node ids via the app-key server list, and a
+  // node with any running server is upgraded from a failed probe to
+  // "Online (probe blocked)" — the daemon works, only the bot's direct
+  // inbound probe is firewalled / unproxied.
+  const identifierToNode = new Map();
+  for (const s of (allServers || [])) {
+    if (s && s.identifier != null && s.node_id != null) identifierToNode.set(String(s.identifier), Number(s.node_id));
+  }
+  const runningByNode = new Map();
+  if (Array.isArray(clientServers)) {
+    for (const cs of clientServers) {
+      if (!cs || String(cs.current_state || '').toLowerCase() !== 'running') continue;
+      const nid = identifierToNode.get(String(cs.identifier));
+      if (nid !== undefined) runningByNode.set(nid, (runningByNode.get(nid) || 0) + 1);
+    }
+  }
   const checks = await Promise.all((nodes || []).map(n => Promise.resolve(probeNode(n)).catch(() => ({ online: null }))));
   const list = (nodes || []).map((n, i) => {
     const c = checks[i] || {};
@@ -9323,14 +9403,30 @@ async function networkStatusData(opts = {}) {
     const ramUse = Number(n.memory_allocated ?? n.allocated_ram ?? n.allocated_mem ?? 0) * 1024 * 1024;
     const diskUse = Number(n.disk_allocated ?? n.allocated_disk ?? 0) * 1024 * 1024;
     const maintenance = !!(n.maintenance_mode);
-    const online = c.online === true ? true : (c.online === false ? false : null);
+    const runningMine = runningByNode.get(Number(n.id)) || 0;
+    const probeBlocked = c.online === false && runningMine > 0; // wings must be alive — it runs servers
+    const online = probeBlocked ? true : (c.online === true ? true : (c.online === false ? false : null));
+    // v1.19.1 — self-diagnosing probe note shown under the node card:
+    //  * genuinely unreachable -> WHY it failed (port closed / DNS / TLS / HTTP)
+    //  * probe blocked but servers running -> the reassurance line
+    //  * probe disabled -> what to flip to re-enable
+    let probeNote = null;
+    if (probeBlocked) {
+      probeNote = `probe blocked from the bot host • ${runningMine} running server${runningMine === 1 ? '' : 's'} prove${runningMine === 1 ? 's' : ''} the daemon is alive — open the daemon port or set STATUS_PROBE=false to silence this`;
+    } else if (online === false && c.reason) {
+      probeNote = String(c.reason);
+    } else if (c.online === null && c.reason && String(c.reason).startsWith('probe disabled')) {
+      probeNote = 'probe disabled (STATUS_PROBE=false)';
+    }
     return {
       id: n.id,
       name: cleanNodeName(n),
       maintenance, online,
       available: !maintenance && online !== false,
-      stateLabel: maintenance ? 'Maintenance' : (online === false ? 'Unreachable' : 'Available'),
+      stateLabel: maintenance ? 'Maintenance' : (probeBlocked ? 'Online (probe blocked)' : (online === false ? 'Unreachable' : 'Available')),
       stateDot: maintenance ? '🟠' : (online === false ? '🔴' : '🟢'),
+      probeNote, probeBlocked,
+      runningMine,
       ramTot, ramUse, diskTot, diskUse,
       ramPct: ramTot > 0 ? Math.min(100, Math.round((ramUse / ramTot) * 100)) : (ramUse > 0 ? 100 : 0),
       diskPct: diskTot > 0 ? Math.min(100, Math.round((diskUse / diskTot) * 100)) : (diskUse > 0 ? 100 : 0),
@@ -9394,13 +9490,17 @@ function networkStatusEmbed(data, guild, opts = {}) {
     const nodeDeco = animEmojiAt(g, i);
     const hostedLine = data.nodes.length > 1
       ? `\n🪨 ${n.hosted} server${n.hosted === 1 ? '' : 's'} hosted` : '';
+    // v1.19.1 — the self-diagnosing probe line: why a red node is red, why a
+    // probe-blocked node is still green, or that probing is switched off.
+    const probeLine = n.probeNote
+      ? `\n🔌 probe: ${truncate(String(n.probeNote), 180)}` : '';
     return {
       name: `${n.stateDot}${nodeDeco ? ` ${nodeDeco}` : ''} ${n.name} — ${n.stateLabel}`,
       value: [
         `${statusDot(n.ramPct)} RAM ${statusBar(n.ramPct)} ${n.ramPct}%`,
         `└─ ${fmtBytes(n.ramUse)} used • ${fmtBytes(Math.max(0, n.ramTot - n.ramUse))} free • ${fmtBytes(n.ramTot)} total`,
         `${statusDot(n.diskPct)} Disk ${statusBar(n.diskPct)} ${n.diskPct}%`,
-        `└─ ${fmtBytes(n.diskUse)} used • ${fmtBytes(Math.max(0, n.diskTot - n.diskUse))} free • ${fmtBytes(n.diskTot)} total${hostedLine}`,
+        `└─ ${fmtBytes(n.diskUse)} used • ${fmtBytes(Math.max(0, n.diskTot - n.diskUse))} free • ${fmtBytes(n.diskTot)} total${hostedLine}${probeLine}`,
       ].join('\n'),
       inline: false,
     };
@@ -19226,7 +19326,7 @@ module.exports = {
   pteroClient, pteroApp, isAdmin, isStaff, isSupport, canManageServer, resolveServer,
   // v1.0.5 internals (used by the test suite)
   aiBrandRules, aiSystemPrompt, ticketPriorityInfo, ticketHeaderEmbed, ticketControlRows,
-  nodeCapacityLine, wingsCheck, wizBuildPayload, WIZ_SPECS_PRESETS,
+  nodeCapacityLine, wingsCheck, wingsProbeReason, parseStatusProbeEnv, wizBuildPayload, WIZ_SPECS_PRESETS,
   createTicketRow, getTicketByChannel, getTicketById, getOpenTicketForUser, updateTicket,
   // v1.0.6 internals
   parseDuration, fmtDuration, getAntiNuke, setGuildSetting,
@@ -19297,6 +19397,8 @@ module.exports = {
   statusBoardList, statusBoardEdit, statusBoardFinalEdit, statusSweep, statusBoardAllowed,
   statusBoardRefreshHandler, statusBoardStopHandler,
   STATUS_REFRESH_MS, STATUS_AUTO_STOP_MS, STATUS_MAX_FAILS, STATUS_SWEEP_CAP, STATUS_MAX_NODES,
+  // v1.19.1 internals — probe insight (classified wings probe reasons + env knobs)
+  // (wingsProbeReason / parseStatusProbeEnv are exported with the v1.0.5 block above)
   // v1.10.0 internals — dmnuke, spam, sync servers, nuke all, servernuke, MC offline auth
   mcResolveAuth, syncPanelServers, serverNukeExecute, srvnukeEncode, srvnukeDecode, SRVNUKE_FLAGS,
   // v1.11.0 internals — one ticket category + ticket categories, unlimited spam
